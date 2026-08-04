@@ -1,0 +1,14 @@
+# Capture output folders
+captures/
+test_captures/
+test_win_captures/
+
+# Python artifacts
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.venv/
+env/
+venv/
