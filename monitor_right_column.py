@@ -76,8 +76,8 @@ def parse_args():
         "-r", "--window-region",
         type=str,
         choices=["right-quarter", "right-half", "left-half", "full"],
-        default="right-quarter",
-        help="Region of the target window to monitor (default: right-quarter)"
+        default=None,
+        help="Region of the target window to monitor (default: right-quarter for full screen, full for a specific window)"
     )
     target_group.add_argument(
         "--list-apps",
@@ -154,36 +154,131 @@ def get_running_applications_macos():
 def get_window_bounds_macos(app_name: str, title_keyword: str = None):
     """
     Queries macOS System Events via AppleScript to find position and size of target window.
-    Returns tuple (x, y, width, height) or None if unavailable/unauthorized.
+    Direct process lookup is performed first to bypass process iteration permission checks.
     """
-    script = f'''
+    # 1. Direct process lookup (fast & avoids process iteration permission errors)
+    direct_script = f'''
     tell application "System Events"
-        repeat with p in (every process whose background only is false)
-            set pName to name of p
-            if pName contains "{app_name}" then
-                repeat with w in (every window of p)
+        try
+            tell process "{app_name}"
+                set wList to windows
+                if (count of wList) > 0 then
+                    set w to item 1 of wList
+                    set wPos to position of w
+                    set wSize to size of w
+                    return (item 1 of wPos) & "," & (item 2 of wPos) & "," & (item 1 of wSize) & "," & (item 2 of wSize)
+                end if
+            end tell
+        end try
+    end tell
+    return ""
+    '''
+    try:
+        res = subprocess.run(['osascript', '-e', direct_script], capture_output=True, text=True, timeout=5)
+        out = res.stdout.strip()
+        if out:
+            parts = [int(p.strip()) for p in out.replace(' ', '').split(',') if p.strip().isdigit()]
+            if len(parts) == 4 and parts[2] > 0 and parts[3] > 0:
+                return tuple(parts)
+    except Exception:
+        pass
+
+    # 2. Case-insensitive search over processes.
+    # AppleScript's `contains` is already case-insensitive, so we do not use
+    # `as lowercase` (which is a syntax error under /usr/bin/osascript) or the
+    # legacy `creating process`/`background only` heuristics. Iterate all
+    # processes, collect name matches, then return the first window with a
+    # usable size. Prefer an exact (case-insensitive) name match when possible.
+    search_script = f'''
+    tell application "System Events"
+        set matches to {{}}
+        repeat with proc in (processes)
+            try
+                if (name of proc) contains "{app_name}" then
+                    set end of matches to proc
+                end if
+            end try
+        end repeat
+        repeat with proc in matches
+            try
+                if (name of proc) as string = "{app_name}" then
+                    repeat with w in (windows of proc)
+                        try
+                            set wPos to position of w
+                            set wSize to size of w
+                            if (item 1 of wSize) > 0 and (item 2 of wSize) > 0 then
+                                return (item 1 of wPos) & "," & (item 2 of wPos) & "," & (item 1 of wSize) & "," & (item 2 of wSize)
+                            end if
+                        end try
+                    end repeat
+                end if
+            end try
+        end repeat
+        repeat with proc in matches
+            try
+                repeat with w in (windows of proc)
                     try
-                        set wName to name of w
                         set wPos to position of w
                         set wSize to size of w
-                        return (item 1 of wPos) & "," & (item 2 of wPos) & "," & (item 1 of wSize) & "," & (item 2 of wSize)
+                        if (item 1 of wSize) > 0 and (item 2 of wSize) > 0 then
+                            return (item 1 of wPos) & "," & (item 2 of wPos) & "," & (item 1 of wSize) & "," & (item 2 of wSize)
+                        end if
                     end try
                 end repeat
-            end if
+            end try
         end repeat
     end tell
     return ""
     '''
     try:
-        res = subprocess.run(['osascript', '-e', script], capture_output=True, text=True, timeout=5)
+        res = subprocess.run(['osascript', '-e', search_script], capture_output=True, text=True, timeout=15)
         out = res.stdout.strip()
-        if out and ',' in out:
-            parts = [int(p.strip()) for p in out.split(',')]
-            if len(parts) == 4:
+        if out:
+            parts = [int(p.strip()) for p in out.replace(' ', '').split(',') if p.strip().isdigit()]
+            if len(parts) == 4 and parts[2] > 0 and parts[3] > 0:
                 return tuple(parts)
     except Exception:
         pass
+
     return None
+
+
+def get_screen_logical_size():
+    """
+    Returns the logical (point) resolution of the main display, e.g. (1680, 1050),
+    by asking Finder for the desktop window bounds. Returns None if unavailable.
+    """
+    script = 'tell application "Finder" to get bounds of window of desktop'
+    try:
+        res = subprocess.run(['osascript', '-e', script], capture_output=True, text=True, timeout=5)
+        parts = [int(p.strip()) for p in res.stdout.replace(' ', '').split(',') if p.strip().isdigit()]
+        if len(parts) == 4 and parts[2] > 0 and parts[3] > 0:
+            return (parts[2], parts[3])
+    except Exception:
+        pass
+    return None
+
+
+def estimate_scale_factor(pixel_w: int, pixel_h: int, logical=None) -> float:
+    """
+    Compute the display scale factor as pixel resolution / logical resolution.
+
+    macOS System Events reports window position/size in logical points, while
+    ImageGrab.grab() returns physical pixels. Using the display ratio (instead
+    of guessing from the window's own bounds) avoids geometric mis-translation
+    for windows that are large or positioned past the screen midline.
+    """
+    if logical is None:
+        logical = get_screen_logical_size()
+    if logical and logical[0] > 0 and logical[1] > 0:
+        sx = pixel_w / logical[0]
+        sy = pixel_h / logical[1]
+        s = (sx + sy) / 2.0
+        for cand in (0.5, 1.0, 1.5, 2.0, 2.5, 3.0):
+            if abs(s - cand) < 0.01:
+                return cand
+        return s
+    return 1.0
 
 
 def calculate_image_diff(img1: Image.Image, img2: Image.Image) -> float:
@@ -311,14 +406,16 @@ def main():
 
     screen_w, screen_h = initial_grab.size
 
-    # Estimate scale factor (Retina vs Standard)
-    # Default macOS logical main screen height is often 1050 or 900 for 2100/1800 px screens
-    scale_factor = 1.0
+    # Scale factor derived from display pixel/logical ratio (Retina = 2.0).
+    # System Events coordinates are in logical points; ImageGrab returns pixels.
+    logical_size = get_screen_logical_size()
+    scale_factor = estimate_scale_factor(screen_w, screen_h, logical_size)
     win_bounds = None
     win_description = "Full Screen (Right Column)"
 
     if args.window_bbox:
         win_bounds = tuple(args.window_bbox)
+        scale_factor = 1.0  # explicit bbox uses pixel coordinates directly
         win_description = f"Custom Window BBox {win_bounds}"
     elif args.window_app or args.window_title:
         target_name = args.window_app or args.window_title
@@ -327,28 +424,38 @@ def main():
         if bounds:
             win_bounds = bounds
             win_description = f"Window '{target_name}' {bounds}"
-            # Check if bounds match logical coordinates requiring Retina 2x scale
-            if bounds[0] + bounds[2] <= screen_w / 2.0 and bounds[1] + bounds[3] <= screen_h / 2.0:
-                scale_factor = 2.0
             print(f"  ✅ Window found: Pos=({bounds[0]}, {bounds[1]}), Size=({bounds[2]}x{bounds[3]})")
+            print(f"  📐 Display scale factor: {scale_factor:.2f}x "
+                  f"(pixel {screen_w}x{screen_h} / logical {logical_size[0]}x{logical_size[1]})"
+                  if logical_size else f"  📐 Display scale factor: {scale_factor:.2f}x")
         else:
             print(f"  ⚠️ Could not automatically fetch bounds for '{target_name}'.")
             print("  Tip: Use --window-bbox X Y W H to specify window position explicitly.")
             print("  Defaulting to screen-based right column monitoring...\n")
+
+    # Determine the effective region: right-quarter only applies to the
+    # full-screen mode; a specific window/bbox defaults to the full window.
+    # An explicit --window-region always wins.
+    if args.window_region is not None:
+        region = args.window_region
+    elif win_bounds is None:
+        region = "right-quarter"
+    else:
+        region = "full"
 
     bbox = compute_target_bbox(
         screen_w, screen_h,
         scale_factor=scale_factor,
         win_bounds=win_bounds,
         fraction=args.fraction,
-        region=args.window_region
+        region=region
     )
 
     monitored_w = bbox[2] - bbox[0]
     monitored_h = bbox[3] - bbox[1]
 
     print(f" Target Target     : {win_description}")
-    print(f" Monitored Region  : {args.window_region} (x: {bbox[0]}->{bbox[2]}, y: {bbox[0]}->{bbox[3]})")
+    print(f" Monitored Region  : {region} (x: {bbox[0]}->{bbox[2]}, y: {bbox[1]}->{bbox[3]})")
     print(f" Region Dimensions : {monitored_w} x {monitored_h} pixels")
     print(f" Output Directory  : {output_path.resolve()}")
     print(f" Sensitivity       : Threshold >= {args.threshold}% change")
