@@ -1,0 +1,5 @@
+# Core requirements
+Pillow>=9.0.0
+
+# Optional dependencies for extended cross-platform automation
+# pyautogui>=0.9.53
