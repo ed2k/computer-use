@@ -967,6 +967,665 @@ def identify_app_window_panels(
     return target_img, panels
 
 
+def is_macos_window_close_button(
+    local_x: int = None,
+    local_y: int = None,
+    screen_x: int = None,
+    screen_y: int = None,
+    hover_delay: float = 0.2
+) -> tuple:
+    """
+    Detects if a candidate red dot is a macOS window close button.
+    If the location is NOT in the top-left corner of the window (local_x > 35 or local_y > 35),
+    it is immediately recognized as an authentic notification red dot with NO hover check needed.
+
+    Returns:
+        tuple: (is_close_button: bool, description_reason: str)
+    """
+    # 1. Location check: macOS window close button is strictly at top-left corner (local_x <= 35 and local_y <= 35)
+    if local_x is not None and local_y is not None:
+        if local_x > 35 or local_y > 35:
+            return False, "Not at top-left corner (Authentic Notification Red Dot)"
+
+    # 2. Only run hover black 'x' check if dot is located at top-left corner
+    if screen_x is not None and screen_y is not None and platform.system() == "Darwin":
+        try:
+            import Quartz
+            point = Quartz.CGPoint(screen_x, screen_y)
+            move_event = Quartz.CGEventCreateMouseEvent(None, Quartz.kCGEventMouseMoved, point, Quartz.kCGMouseButtonLeft)
+            Quartz.CGEventPost(Quartz.kCGHIDEventTap, move_event)
+            time.sleep(hover_delay)
+        except Exception as e:
+            print(f"⚠️ Mouse hover movement error: {e}", file=sys.stderr, flush=True)
+
+        try:
+            roi_bbox = (max(0, screen_x - 15), max(0, screen_y - 15), screen_x + 15, screen_y + 15)
+            roi_img = ImageGrab.grab(bbox=roi_bbox)
+            rgb = roi_img.convert("RGB")
+            pixels = rgb.load()
+            w, h = roi_img.size
+
+            dark_pixel_count = 0
+            red_pixel_count = 0
+
+            for y in range(h):
+                for x in range(w):
+                    r, g, b = pixels[x, y]
+                    if r > 160 and g < 110 and b < 110 and (r - g) > 50 and (r - b) > 50:
+                        red_pixel_count += 1
+                    elif r < 75 and g < 75 and b < 75:
+                        dark_pixel_count += 1
+
+            if dark_pixel_count >= 6 and red_pixel_count >= 10:
+                return True, f"macOS Window Close Button (detected {dark_pixel_count} black 'x' pixels inside red dot)"
+
+        except Exception as e:
+            print(f"⚠️ Error grabbing hover ROI: {e}", file=sys.stderr, flush=True)
+
+    if local_x is not None and local_y is not None and local_x <= 35 and local_y <= 35:
+        return True, f"macOS Window Close Button (Top-Left Titlebar Header Position: local=({local_x}, {local_y}))"
+
+    return False, "Authentic Notification Red Dot"
+
+
+def locate_red_dots_in_window(
+    app_name: str = None,
+    window_bbox: tuple = None,
+    img: Image.Image = None,
+    min_radius: float = 3.0,
+    max_radius: float = 7.0,
+    draw_annotation: bool = False,
+    output_path: str = None
+) -> tuple:
+    """
+    Locates authentic solid small red notification dots inside a target window or screenshot.
+    Filters out tiny noise artifacts (radius < 3.0px), large three-dots red circles (radius > 7.0px),
+    and macOS window close control red dots (local_x <= 35 and local_y <= 35).
+
+    Args:
+        app_name (str, optional): Target application name to locate and capture (e.g., 'WeChat', 'Google Chrome').
+        window_bbox (tuple, optional): Explicit window bounding box (left, top, right, bottom).
+        img (PIL.Image.Image, optional): Direct window screenshot PIL Image object.
+        min_radius (float): Minimum dot radius threshold (default: 3.0px).
+        max_radius (float): Maximum dot radius threshold for solid small red dots (default: 7.0px).
+        draw_annotation (bool): If True, overlays yellow target circles and labels on window capture.
+        output_path (str, optional): File path to save annotated screenshot.
+
+    Returns:
+        tuple: (target_image, list_of_red_dot_dicts)
+            - target_image: PIL Image of captured window.
+            - list_of_red_dot_dicts: List of detected authentic small red dot dictionaries.
+    """
+    win_left, win_top = 0, 0
+    target_img = None
+
+    if img is not None:
+        target_img = img
+    elif window_bbox is not None:
+        win_left, win_top = window_bbox[0], window_bbox[1]
+        try:
+            target_img = ImageGrab.grab(bbox=window_bbox)
+        except Exception:
+            pass
+    elif app_name:
+        if platform.system() == "Darwin":
+            try:
+                import Quartz
+                options = Quartz.kCGWindowListOptionOnScreenOnly | Quartz.kCGWindowListExcludeDesktopElements
+                w_list = Quartz.CGWindowListCopyWindowInfo(options, Quartz.kCGNullWindowID)
+                for w in w_list:
+                    owner = w.get("kCGWindowOwnerName", "")
+                    if app_name.lower() in owner.lower() and w.get("kCGWindowLayer", 0) <= 5:
+                        b = w.get("kCGWindowBounds", {})
+                        wx = int(b.get("X", 0))
+                        wy = int(b.get("Y", 0))
+                        ww = int(b.get("Width", 0))
+                        wh = int(b.get("Height", 0))
+                        if ww > 100 and wh > 100:
+                            win_left, win_top = wx, wy
+                            target_img = ImageGrab.grab(bbox=(wx, wy, wx + ww, wy + wh))
+                            break
+            except Exception as e:
+                print(f"⚠️ Quartz query error for '{app_name}': {e}", file=sys.stderr, flush=True)
+
+    if target_img is None:
+        try:
+            target_img = ImageGrab.grab()
+        except Exception:
+            target_img = Image.new("RGB", (800, 600), (240, 240, 240))
+
+    w, h = target_img.size
+    rgb_img = target_img.convert("RGB")
+    pixels = rgb_img.load()
+
+    # Mask red notification pixels
+    red_points = []
+    for y in range(h):
+        for x in range(w):
+            r, g, b = pixels[x, y]
+            if r > 160 and g < 110 and b < 110 and (r - g) > 60 and (r - b) > 60:
+                red_points.append((x, y))
+
+    if not red_points:
+        return target_img, []
+
+    visited = set()
+    clusters = []
+
+    for px, py in red_points:
+        if (px, py) in visited:
+            continue
+
+        cluster = []
+        queue = [(px, py)]
+        visited.add((px, py))
+
+        while queue:
+            cx, cy = queue.pop(0)
+            cluster.append((cx, cy))
+
+            for dx in (-1, 0, 1):
+                for dy in (-1, 0, 1):
+                    if dx == 0 and dy == 0:
+                        continue
+                    nx, ny = cx + dx, cy + dy
+                    if 0 <= nx < w and 0 <= ny < h and (nx, ny) not in visited:
+                        nr, ng, nb = pixels[nx, ny]
+                        if nr > 160 and ng < 110 and nb < 110 and (nr - ng) > 60 and (nr - nb) > 60:
+                            visited.add((nx, ny))
+                            queue.append((nx, ny))
+
+        if len(cluster) >= 4:
+            clusters.append(cluster)
+
+    detected_dots = []
+    dot_id = 1
+
+    for cluster in clusters:
+        xs = [pt[0] for pt in cluster]
+        ys = [pt[1] for pt in cluster]
+
+        left, right = min(xs), max(xs) + 1
+        top, bottom = min(ys), max(ys) + 1
+
+        bw = right - left
+        bh = bottom - top
+        radius = (bw + bh) / 4.0
+
+        # Filter out macOS window close red dot at top-left titlebar position (local_x <= 35 and local_y <= 35)
+        if left <= 35 and top <= 35:
+            continue
+
+        if min_radius <= radius <= max_radius and 0.5 <= (bw / float(bh)) <= 2.0:
+            center_x = sum(xs) // len(xs)
+            center_y = sum(ys) // len(ys)
+
+            dot_info = {
+                "dot_id": dot_id,
+                "local_center": (center_x, center_y),
+                "screen_center": (win_left + center_x, win_top + center_y),
+                "local_bbox": (left, top, right, bottom),
+                "screen_bbox": (win_left + left, win_top + top, win_left + right, win_top + bottom),
+                "width": bw,
+                "height": bh,
+                "radius": round(radius, 1),
+                "pixel_count": len(cluster)
+            }
+            detected_dots.append(dot_info)
+            dot_id += 1
+
+    # Optional visual annotation drawing
+    if draw_annotation or output_path:
+        try:
+            annotated = target_img.copy().convert("RGB")
+            draw = ImageDraw.Draw(annotated)
+
+            for dot in detected_dots:
+                cx, cy = dot["local_center"]
+                r = int(max(8, dot["radius"] + 4))
+
+                # Draw bright yellow target ring around red dot
+                draw.ellipse([cx - r - 1, cy - r - 1, cx + r + 1, cy + r + 1], outline=(0, 0, 0), width=4)
+                draw.ellipse([cx - r, cy - r, cx + r, cy + r], outline=(255, 255, 0), width=2)
+
+                label = f" 🔴 #{dot['dot_id']} ({cx},{cy}) r={dot['radius']}px "
+                draw.rectangle([cx + r + 4, cy - 10, cx + r + 4 + len(label) * 7, cy + 10], fill=(0, 0, 0))
+                draw.text((cx + r + 8, cy - 8), label, fill=(255, 255, 0))
+
+            if output_path:
+                out_p = Path(output_path)
+                out_p.parent.mkdir(parents=True, exist_ok=True)
+                annotated.save(out_p)
+                print(f"📷 Saved Red Dots Annotation: {out_p.resolve()}", flush=True)
+
+        except Exception as e:
+            print(f"⚠️ Error rendering red dots annotation: {e}", file=sys.stderr, flush=True)
+
+    return target_img, detected_dots
+
+
+def locate_three_dots_red_circle_in_window(
+    app_name: str = None,
+    window_bbox: tuple = None,
+    img: Image.Image = None,
+    min_radius: float = 7.5,
+    max_radius: float = 25.0,
+    draw_annotation: bool = False,
+    output_path: str = None
+) -> tuple:
+    """
+    Locates three-dots red circle badges / large ellipsis unread badges inside a target application window or screenshot.
+
+    Args:
+        app_name (str, optional): Target application name to locate and capture (e.g., 'WeChat', 'Google Chrome').
+        window_bbox (tuple, optional): Explicit window bounding box (left, top, right, bottom).
+        img (PIL.Image.Image, optional): Direct window screenshot PIL Image object.
+        min_radius (float): Minimum badge radius threshold (default: 7.5px).
+        max_radius (float): Maximum badge radius threshold (default: 25.0px).
+        draw_annotation (bool): If True, overlays magenta target rings and labels on window capture.
+        output_path (str, optional): File path to save annotated screenshot.
+
+    Returns:
+        tuple: (target_image, list_of_three_dots_badge_dicts)
+            - target_image: PIL Image of captured window.
+            - list_of_three_dots_badge_dicts: List of detected three-dots red circle badge dictionaries.
+    """
+    win_left, win_top = 0, 0
+    target_img = None
+
+    if img is not None:
+        target_img = img
+    elif window_bbox is not None:
+        win_left, win_top = window_bbox[0], window_bbox[1]
+        try:
+            target_img = ImageGrab.grab(bbox=window_bbox)
+        except Exception:
+            pass
+    elif app_name:
+        if platform.system() == "Darwin":
+            try:
+                import Quartz
+                options = Quartz.kCGWindowListOptionOnScreenOnly | Quartz.kCGWindowListExcludeDesktopElements
+                w_list = Quartz.CGWindowListCopyWindowInfo(options, Quartz.kCGNullWindowID)
+                for w in w_list:
+                    owner = w.get("kCGWindowOwnerName", "")
+                    if app_name.lower() in owner.lower() and w.get("kCGWindowLayer", 0) <= 5:
+                        b = w.get("kCGWindowBounds", {})
+                        wx = int(b.get("X", 0))
+                        wy = int(b.get("Y", 0))
+                        ww = int(b.get("Width", 0))
+                        wh = int(b.get("Height", 0))
+                        if ww > 100 and wh > 100:
+                            win_left, win_top = wx, wy
+                            target_img = ImageGrab.grab(bbox=(wx, wy, wx + ww, wy + wh))
+                            break
+            except Exception as e:
+                print(f"⚠️ Quartz query error for '{app_name}': {e}", file=sys.stderr, flush=True)
+
+    if target_img is None:
+        try:
+            target_img = ImageGrab.grab()
+        except Exception:
+            target_img = Image.new("RGB", (800, 600), (240, 240, 240))
+
+    w, h = target_img.size
+    rgb_img = target_img.convert("RGB")
+    pixels = rgb_img.load()
+
+    # Mask ONLY red background pixels
+    red_points = []
+    for y in range(h):
+        for x in range(w):
+            r, g, b = pixels[x, y]
+            if r > 160 and g < 110 and b < 110 and (r - g) > 60 and (r - b) > 60:
+                red_points.append((x, y))
+
+    if not red_points:
+        return target_img, []
+
+    visited = set()
+    clusters = []
+
+    for px, py in red_points:
+        if (px, py) in visited:
+            continue
+
+        cluster = []
+        queue = [(px, py)]
+        visited.add((px, py))
+
+        while queue:
+            cx, cy = queue.pop(0)
+            cluster.append((cx, cy))
+
+            for dx in (-1, 0, 1):
+                for dy in (-1, 0, 1):
+                    if dx == 0 and dy == 0:
+                        continue
+                    nx, ny = cx + dx, cy + dy
+                    if 0 <= nx < w and 0 <= ny < h and (nx, ny) not in visited:
+                        nr, ng, nb = pixels[nx, ny]
+                        if nr > 160 and ng < 110 and nb < 110 and (nr - ng) > 60 and (nr - nb) > 60:
+                            visited.add((nx, ny))
+                            queue.append((nx, ny))
+
+        if len(cluster) >= 15:
+            clusters.append(cluster)
+
+    detected_badges = []
+    badge_id = 1
+
+    for cluster in clusters:
+        xs = [pt[0] for pt in cluster]
+        ys = [pt[1] for pt in cluster]
+
+        left, right = min(xs), max(xs) + 1
+        top, bottom = min(ys), max(ys) + 1
+
+        bw = right - left
+        bh = bottom - top
+        radius = (bw + bh) / 4.0
+
+        # Filter for large red circle badges (radius >= 7.5px)
+        if min_radius <= radius <= max_radius and 0.6 <= (bw / float(bh)) <= 1.8:
+            center_x = sum(xs) // len(xs)
+            center_y = sum(ys) // len(ys)
+
+            # Count white interior pixels inside the red bounding box
+            white_count = 0
+            for cy in range(max(0, top), min(h, bottom)):
+                for cx in range(max(0, left), min(w, right)):
+                    pr, pg, pb = pixels[cx, cy]
+                    if pr > 190 and pg > 190 and pb > 190:
+                        white_count += 1
+
+            badge_info = {
+                "badge_id": badge_id,
+                "symbol": "...",
+                "local_center": (center_x, center_y),
+                "screen_center": (win_left + center_x, win_top + center_y),
+                "local_bbox": (left, top, right, bottom),
+                "screen_bbox": (win_left + left, win_top + top, win_left + right, win_top + bottom),
+                "width": bw,
+                "height": bh,
+                "radius": round(radius, 1),
+                "white_interior_pixels": white_count
+            }
+            detected_badges.append(badge_info)
+            badge_id += 1
+
+    # Optional visual annotation drawing
+    if draw_annotation or output_path:
+        try:
+            annotated = target_img.copy().convert("RGB")
+            draw = ImageDraw.Draw(annotated)
+
+            for b in detected_badges:
+                cx, cy = b["local_center"]
+                r = int(max(10, b["radius"] + 4))
+
+                # Draw magenta ring around three-dots red circle badge
+                draw.ellipse([cx - r - 1, cy - r - 1, cx + r + 1, cy + r + 1], outline=(0, 0, 0), width=4)
+                draw.ellipse([cx - r, cy - r, cx + r, cy + r], outline=(255, 0, 255), width=2)
+
+                label = f" 🔴 ... #{b['badge_id']} ({cx},{cy}) r={b['radius']}px "
+                draw.rectangle([cx + r + 4, cy - 10, cx + r + 4 + len(label) * 7, cy + 10], fill=(0, 0, 0))
+                draw.text((cx + r + 8, cy - 8), label, fill=(255, 0, 255))
+
+            if output_path:
+                out_p = Path(output_path)
+                out_p.parent.mkdir(parents=True, exist_ok=True)
+                annotated.save(out_p)
+                print(f"📷 Saved Three-Dots Red Circle Annotation: {out_p.resolve()}", flush=True)
+
+        except Exception as e:
+            print(f"⚠️ Error rendering three-dots red circle annotation: {e}", file=sys.stderr, flush=True)
+
+    return target_img, detected_badges
+
+
+def is_left_angle_bracket(cluster: list, left: int, top: int, right: int, bottom: int, cw: int, ch: int) -> tuple:
+    """
+    Strictly evaluates if a connected pixel cluster forms an authentic Left Angle Bracket / Chevron '<' or '‹'.
+    Verifies:
+      1. Size & Aspect Ratio: ch >= 8, 1.0 <= (ch / cw) <= 2.8
+      2. Low fill density (thin line stroke with hollow interior): pixel_count / (cw * ch) <= 0.45
+      3. Sharp single vertex tip at left-most x centered vertically
+      4. Symmetric top-right and bottom-right diagonal arms
+      5. Empty hollow center interior node between arms
+    """
+    if not (4 <= cw <= 25 and 8 <= ch <= 35 and 1.0 <= (ch / float(cw)) <= 2.8):
+        return False, 0.0
+
+    fill_density = len(cluster) / float(cw * ch)
+    if fill_density > 0.45:
+        return False, 0.0
+
+    col_dict = {}
+    for px, py in cluster:
+        col_dict.setdefault(px, []).append(py)
+
+    # 1. Leftmost column (vertex tip) must be narrow and centered vertically
+    left_ys = col_dict.get(left, []) + col_dict.get(left + 1, [])
+    if not left_ys:
+        return False, 0.0
+
+    vertex_span = max(left_ys) - min(left_ys) + 1
+    if vertex_span > max(2, int(ch * 0.35)):
+        return False, 0.0
+
+    vertex_y = sum(left_ys) / float(len(left_ys))
+    if abs(vertex_y - (top + ch / 2.0)) > ch * 0.25:
+        return False, 0.0
+
+    # 2. Rightmost columns must split into top arm and bottom arm
+    right_ys = col_dict.get(right - 1, []) + col_dict.get(right - 2, [])
+    if not right_ys:
+        return False, 0.0
+
+    top_arm_ys = [y for y in right_ys if y <= top + ch * 0.35]
+    bot_arm_ys = [y for y in right_ys if y >= top + ch * 0.65]
+
+    if not top_arm_ys or not bot_arm_ys:
+        return False, 0.0
+
+    # 3. Center middle interior point must be empty background (hollow chevron arms)
+    mid_x = left + cw // 2
+    mid_y = top + ch // 2
+    mid_pts = col_dict.get(mid_x, [])
+    if any(abs(y - mid_y) <= 1 for y in mid_pts):
+        return False, 0.0
+
+    score = 100.0 - abs(vertex_y - (top + ch / 2.0)) * 5.0 - fill_density * 50.0
+    return True, max(50.0, score)
+
+
+def nms_non_overlapping_boxes(boxes: list) -> list:
+    """
+    Applies Non-Maximum Suppression (NMS) to ensure strictly ZERO overlapping bounding boxes.
+    """
+    if not boxes:
+        return []
+
+    sorted_boxes = sorted(boxes, key=lambda b: b["score"], reverse=True)
+    kept_boxes = []
+
+    for b in sorted_boxes:
+        b_left, b_top, b_right, b_bottom = b["local_bbox"]
+        overlap = False
+
+        for k in kept_boxes:
+            k_left, k_top, k_right, k_bottom = k["local_bbox"]
+
+            ix1, iy1 = max(b_left, k_left), max(b_top, k_top)
+            ix2, iy2 = min(b_right, k_right), min(b_bottom, k_bottom)
+
+            if ix2 > ix1 and iy2 > iy1:
+                overlap = True
+                break
+
+        if not overlap:
+            kept_boxes.append(b)
+
+    # Sort kept boxes top-to-bottom, left-to-right
+    kept_boxes = sorted(kept_boxes, key=lambda b: (b["local_bbox"][1], b["local_bbox"][0]))
+    for idx, b in enumerate(kept_boxes, 1):
+        b["bracket_id"] = idx
+
+    return kept_boxes
+
+
+def locate_left_bracket_in_window(
+    app_name: str = None,
+    window_bbox: tuple = None,
+    img: Image.Image = None,
+    draw_annotation: bool = False,
+    output_path: str = None
+) -> tuple:
+    """
+    Locates left angle bracket / chevron signs ('<', '‹', '⟨') inside a target application window or screenshot.
+    Applies Non-Maximum Suppression (NMS) to ensure all returned bounding boxes are strictly non-overlapping.
+
+    Args:
+        app_name (str, optional): Target application name to locate and capture (e.g., 'WeChat', 'Google Chrome').
+        window_bbox (tuple, optional): Explicit window bounding box (left, top, right, bottom).
+        img (PIL.Image.Image, optional): Direct window screenshot PIL Image object.
+        draw_annotation (bool): If True, overlays cyan target boxes and labels on window capture.
+        output_path (str, optional): File path to save annotated screenshot.
+
+    Returns:
+        tuple: (target_image, list_of_bracket_dicts)
+            - target_image: PIL Image of captured window.
+            - list_of_bracket_dicts: List of non-overlapping detected left angle bracket dictionaries.
+    """
+    win_left, win_top = 0, 0
+    target_img = None
+
+    if img is not None:
+        target_img = img
+    elif window_bbox is not None:
+        win_left, win_top = window_bbox[0], window_bbox[1]
+        try:
+            target_img = ImageGrab.grab(bbox=window_bbox)
+        except Exception:
+            pass
+    elif app_name:
+        if platform.system() == "Darwin":
+            try:
+                import Quartz
+                options = Quartz.kCGWindowListOptionOnScreenOnly | Quartz.kCGWindowListExcludeDesktopElements
+                w_list = Quartz.CGWindowListCopyWindowInfo(options, Quartz.kCGNullWindowID)
+                for w in w_list:
+                    owner = w.get("kCGWindowOwnerName", "")
+                    if app_name.lower() in owner.lower() and w.get("kCGWindowLayer", 0) <= 5:
+                        b = w.get("kCGWindowBounds", {})
+                        wx = int(b.get("X", 0))
+                        wy = int(b.get("Y", 0))
+                        ww = int(b.get("Width", 0))
+                        wh = int(b.get("Height", 0))
+                        if ww > 100 and wh > 100:
+                            win_left, win_top = wx, wy
+                            target_img = ImageGrab.grab(bbox=(wx, wy, wx + ww, wy + wh))
+                            break
+            except Exception as e:
+                print(f"⚠️ Quartz query error for '{app_name}': {e}", file=sys.stderr, flush=True)
+
+    if target_img is None:
+        try:
+            target_img = ImageGrab.grab()
+        except Exception:
+            target_img = Image.new("RGB", (800, 600), (240, 240, 240))
+
+    w, h = target_img.size
+    gray = target_img.convert("L")
+
+    # Binarize dark glyphs on light background
+    bw = gray.point(lambda p: 255 if p < 110 else 0)
+    pixels = bw.load()
+    visited = set()
+    clusters = []
+
+    for y in range(h):
+        for x in range(w):
+            if pixels[x, y] == 255 and (x, y) not in visited:
+                cluster = []
+                queue = [(x, y)]
+                visited.add((x, y))
+
+                while queue:
+                    cx, cy = queue.pop(0)
+                    cluster.append((cx, cy))
+                    for dx in (-1, 0, 1):
+                        for dy in (-1, 0, 1):
+                            if dx == 0 and dy == 0:
+                                continue
+                            nx, ny = cx + dx, cy + dy
+                            if 0 <= nx < w and 0 <= ny < h and (nx, ny) not in visited and pixels[nx, ny] == 255:
+                                visited.add((nx, ny))
+                                queue.append((nx, ny))
+
+                if 4 <= len(cluster) <= 300:
+                    clusters.append(cluster)
+
+    raw_candidates = []
+    for cluster in clusters:
+        xs = [pt[0] for pt in cluster]
+        ys = [pt[1] for pt in cluster]
+
+        left, right = min(xs), max(xs) + 1
+        top, bottom = min(ys), max(ys) + 1
+
+        cw = right - left
+        ch = bottom - top
+
+        is_angle, score = is_left_angle_bracket(cluster, left, top, right, bottom, cw, ch)
+        if is_angle:
+            center_x = left + cw // 2
+            center_y = top + ch // 2
+
+            raw_candidates.append({
+                "symbol": "<",
+                "score": round(score, 2),
+                "local_center": (center_x, center_y),
+                "screen_center": (win_left + center_x, win_top + center_y),
+                "local_bbox": (left, top, right, bottom),
+                "screen_bbox": (win_left + left, win_top + top, win_left + right, win_top + bottom),
+                "width": cw,
+                "height": ch
+            })
+
+    # Enforce strictly non-overlapping bounding boxes via NMS
+    detected_brackets = nms_non_overlapping_boxes(raw_candidates)
+
+    # Optional visual annotation drawing
+    if draw_annotation or output_path:
+        try:
+            annotated = target_img.copy().convert("RGB")
+            draw = ImageDraw.Draw(annotated)
+
+            for b in detected_brackets:
+                cx, cy = b["local_center"]
+                left, top, right, bottom = b["local_bbox"]
+
+                draw.rectangle([left - 2, top - 2, right + 2, bottom + 2], outline=(0, 0, 0), width=3)
+                draw.rectangle([left - 1, top - 1, right + 1, bottom + 1], outline=(0, 255, 255), width=2)
+
+                label = f" < #{b['bracket_id']} ({cx},{cy}) "
+                draw.rectangle([right + 4, top - 4, right + 4 + len(label) * 7, top + 14], fill=(0, 0, 0))
+                draw.text((right + 8, top - 2), label, fill=(0, 255, 255))
+
+            if output_path:
+                out_p = Path(output_path)
+                out_p.parent.mkdir(parents=True, exist_ok=True)
+                annotated.save(out_p)
+                print(f"📷 Saved Left Angle Brackets Annotation: {out_p.resolve()}", flush=True)
+
+        except Exception as e:
+            print(f"⚠️ Error rendering left angle brackets annotation: {e}", file=sys.stderr, flush=True)
+
+    return target_img, detected_brackets
+
+
 def parse_args():
     parser = argparse.ArgumentParser(
         description="Monitor the right 1/4 column of screen or a specific application window for changes."
@@ -1031,6 +1690,36 @@ def parse_args():
         "--draw-panels",
         action="store_true",
         help="Draw colored bounding boxes and labels for identified app sub-panels and save screenshot"
+    )
+    target_group.add_argument(
+        "--locate-red-dots",
+        action="store_true",
+        help="Locate red notification dots / unread badges inside target app window and exit"
+    )
+    target_group.add_argument(
+        "--draw-red-dots",
+        action="store_true",
+        help="Draw target indicators around located red notification dots and save screenshot"
+    )
+    target_group.add_argument(
+        "--locate-left-brackets",
+        action="store_true",
+        help="Locate left small bracket / chevron signs ('(', '<', '‹') inside target app window and exit"
+    )
+    target_group.add_argument(
+        "--draw-left-brackets",
+        action="store_true",
+        help="Draw target indicators around located left small brackets and save screenshot"
+    )
+    target_group.add_argument(
+        "--locate-three-dots-red-circle",
+        action="store_true",
+        help="Locate three-dots red circle badges ('...') inside target app window and exit"
+    )
+    target_group.add_argument(
+        "--draw-three-dots-red-circle",
+        action="store_true",
+        help="Draw target indicators around located three-dots red circle badges and save screenshot"
     )
 
     # Sampling & Detection settings
@@ -1436,6 +2125,99 @@ def main():
                 print(f"  Panel #{p['panel_id']:2d}: Tag: {p['tag']:20s} | Size: {p['width']:4d}x{p['height']:<4d} | Local: ({lb[0]}, {lb[1]}, {lb[2]}, {lb[3]}) | Screen: ({sb[0]}, {sb[1]}, {sb[2]}, {sb[3]})")
         else:
             print("  No sub-panel areas detected.")
+        print("=" * 85)
+        sys.exit(0)
+
+    # If --locate-red-dots requested, find red notification dots in target app window and exit
+    if args.locate_red_dots or args.draw_red_dots:
+        out_file = None
+        if args.draw_red_dots or args.output_dir:
+            out_dir = Path(args.output_dir)
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            app_tag = args.window_app.replace(" ", "_") if args.window_app else "window"
+            out_file = str((out_dir / f"red_dots_{app_tag}_{ts}.png").resolve())
+
+        win_bbox_tuple = tuple(args.window_bbox) if args.window_bbox else None
+        _, dots = locate_red_dots_in_window(
+            app_name=args.window_app,
+            window_bbox=win_bbox_tuple,
+            draw_annotation=args.draw_red_dots,
+            output_path=out_file
+        )
+
+        target_name = args.window_app or "Target Application Window"
+        print("=" * 85)
+        print(f" 🔴 LOCATED RED NOTIFICATION DOTS for '{target_name}' ({len(dots)} found)")
+        print("=" * 85)
+        if dots:
+            for dot in dots:
+                lc = dot["local_center"]
+                sc = dot["screen_center"]
+                print(f"  Dot #{dot['dot_id']:2d}: Local Center: ({lc[0]:4d}, {lc[1]:<4d}) | Screen Center: ({sc[0]:4d}, {sc[1]:<4d}) | Radius: {dot['radius']:4.1f}px | BBox: {dot['local_bbox']}")
+        else:
+            print("  No red notification dots detected.")
+        print("=" * 85)
+        sys.exit(0)
+
+    # If --locate-left-brackets requested, find left small bracket / chevron signs in target app window and exit
+    if args.locate_left_brackets or args.draw_left_brackets:
+        out_file = None
+        if args.draw_left_brackets or args.output_dir:
+            out_dir = Path(args.output_dir)
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            app_tag = args.window_app.replace(" ", "_") if args.window_app else "window"
+            out_file = str((out_dir / f"left_brackets_{app_tag}_{ts}.png").resolve())
+
+        win_bbox_tuple = tuple(args.window_bbox) if args.window_bbox else None
+        _, brackets = locate_left_bracket_in_window(
+            app_name=args.window_app,
+            window_bbox=win_bbox_tuple,
+            draw_annotation=args.draw_left_brackets,
+            output_path=out_file
+        )
+
+        target_name = args.window_app or "Target Application Window"
+        print("=" * 85)
+        print(f" ‹ LOCATED LEFT SMALL BRACKET SIGNS for '{target_name}' ({len(brackets)} found)")
+        print("=" * 85)
+        if brackets:
+            for b in brackets:
+                lc = b["local_center"]
+                sc = b["screen_center"]
+                print(f"  Bracket #{b['bracket_id']:2d}: Local Center: ({lc[0]:4d}, {lc[1]:<4d}) | Screen Center: ({sc[0]:4d}, {sc[1]:<4d}) | Size: {b['width']:2d}x{b['height']:<2d} | BBox: {b['local_bbox']}")
+        else:
+            print("  No left small bracket signs detected.")
+        print("=" * 85)
+        sys.exit(0)
+
+    # If --locate-three-dots-red-circle requested, find three-dots red circle badges in target app window and exit
+    if args.locate_three_dots_red_circle or args.draw_three_dots_red_circle:
+        out_file = None
+        if args.draw_three_dots_red_circle or args.output_dir:
+            out_dir = Path(args.output_dir)
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            app_tag = args.window_app.replace(" ", "_") if args.window_app else "window"
+            out_file = str((out_dir / f"three_dots_red_circle_{app_tag}_{ts}.png").resolve())
+
+        win_bbox_tuple = tuple(args.window_bbox) if args.window_bbox else None
+        _, badges = locate_three_dots_red_circle_in_window(
+            app_name=args.window_app,
+            window_bbox=win_bbox_tuple,
+            draw_annotation=args.draw_three_dots_red_circle,
+            output_path=out_file
+        )
+
+        target_name = args.window_app or "Target Application Window"
+        print("=" * 85)
+        print(f" 🔴 ... LOCATED THREE-DOTS RED CIRCLE BADGES for '{target_name}' ({len(badges)} found)")
+        print("=" * 85)
+        if badges:
+            for b in badges:
+                lc = b["local_center"]
+                sc = b["screen_center"]
+                print(f"  Badge #{b['badge_id']:2d}: Local Center: ({lc[0]:4d}, {lc[1]:<4d}) | Screen Center: ({sc[0]:4d}, {sc[1]:<4d}) | Radius: {b['radius']:4.1f}px | BBox: {b['local_bbox']}")
+        else:
+            print("  No three-dots red circle badges detected.")
         print("=" * 85)
         sys.exit(0)
     if args.scroll_and_measure:
